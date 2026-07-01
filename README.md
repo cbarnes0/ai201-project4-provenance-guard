@@ -2,41 +2,7 @@
 
 An HTTP API that classifies text as AI-generated or human-written, returns a calibrated confidence score, and surfaces a transparency label a platform could display to readers. Creators can contest a decision through an appeals endpoint. Every decision is captured in a structured audit log.
 
----
-
-## Architecture & Design Decisions
-
-### Why two signals?
-
-Single-signal detection has an obvious failure mode: if the signal is wrong, there is no check. The two signals chosen here fail in opposite directions, which is the point.
-
-**Signal 1 — Stylometric heuristics** measures the *statistical structure* of writing: how uniform sentence lengths are, how formal the vocabulary register is, how varied the punctuation is. It runs entirely in Python with no external API call. AI writing is structurally uniform — LLMs optimize for readable, coherent output, which means their sentence lengths cluster, their vocabulary sits in a predictable mid-range, and their punctuation is conventional. Human writing reflects moods and habits.
-
-**Signal 2 — LLM classification via Groq** measures *semantic and stylistic feel*: whether the text uses hedging phrases, has authentic emotional texture, shows personal specificity, or carries the idiosyncratic choices of a real writer. This runs against `llama-3.3-70b-versatile` at temperature 0.1.
-
-These two signals are genuinely independent. Stylometrics reads patterns in character sequences without understanding meaning. The LLM reads meaning without running any statistics. The same text can produce discordant scores — the spec's sun/porch text scored 0.73 on stylometrics (two nearly identical sentence lengths → low CV) but 0.2 on the LLM (the model recognized emotional authenticity). The combined score, 0.41, correctly reflects that the signals disagree, and the UNCERTAIN label fires instead of a false confident accusation.
-
-### Why 60/40 weighting?
-
-LLM classification carries more weight (60%) because it captures properties that statistics cannot: hedging language, authentic voice, personal detail. Stylometrics is fast, interpretable, and works without an API key — but on short creative texts it is a weaker prior. A writer who naturally structures clean paragraphs will look AI-like stylometrically. The LLM is better at correcting that.
-
-The 40% weight for stylometrics is not decorative. When the LLM is unavailable (API failure), stylometrics degrades gracefully to a reasonable fallback score. When the LLM is uncertain (returns ~0.5), stylometrics breaks the tie. And in cases where they agree strongly, the 40% contribution pushes the combined score further from 0.5, increasing displayed confidence.
-
-### Why this threshold design?
-
-The thresholds (≥0.70 = AI, ≤0.30 = Human, else UNCERTAIN) are deliberately asymmetric toward caution. A system that falsely accuses a human writer of plagiarism causes real harm; a system that expresses uncertainty costs nothing. The 0.70 floor means a combined score needs both signals leaning AI before the HIGH_CONFIDENCE_AI label fires. A score of 0.65 — where the LLM says 0.70 and stylometrics says 0.57 — stays UNCERTAIN, which is the right answer.
-
-The displayed confidence percentage (`|score - 0.5| × 200`) is a separate quantity from the raw score. It tells a non-technical reader how far from a coin-flip the system is, not what the underlying probability is. A score of 0.71 maps to "High Confidence (42%)" — which is honest. It crossed the threshold, but barely.
-
-### What I would change for real deployment
-
-Three things:
-
-1. **Persistent storage.** The audit log is in-memory and resets on restart. A production version needs a database (SQLite is sufficient for moderate volume; PostgreSQL for scale). The `audit.py` module is isolated — the dict can be swapped for a DB-backed store with no changes to any other file.
-
-2. **LLM cost controls.** Every `/submit` call hits the Groq API. At scale this becomes expensive. A production version would cache classifications for identical text (hash-keyed), or use a cheaper embedding-based first pass that only escalates to the full LLM for uncertain cases.
-
-3. **Signal calibration with labeled data.** The current thresholds (0.30/0.70) and sub-metric weights were calibrated by hand against a small test set. Real calibration requires a labeled corpus of known AI and human texts and systematic threshold tuning (e.g., ROC analysis). The TTR→average-word-length adaptation for short texts was discovered empirically during testing, not from prior research — a real system would run this analysis before choosing metrics.
+**[Portfolio walkthrough video (Google Drive)](https://drive.google.com/file/d/1FuazPAMIhde4OtKT5LF2rhbSHiu8KICq/view?usp=sharing)**
 
 ---
 
@@ -62,85 +28,73 @@ python app.py
 
 ---
 
-## API Reference
+## Architecture Overview
 
-### POST /submit
+### Submission path
 
-**Request**
-```json
-{
-  "text": "The fog came on little cat feet...",
-  "creator_id": "user-123"
-}
+A `POST /submit` request travels through this pipeline before returning a response:
+
+```
+POST /submit
+    │
+    ├─ Rate limiter (10/min, 50/hr per IP)
+    │       └─ OVER LIMIT → 429
+    │
+    ├─ Input validator (text required, ≤10,000 chars)
+    │       └─ INVALID → 400
+    │
+    ├─ Signal 1: stylometric_analyze(text)        ← pure Python, no network
+    │       └─ StylometricResult(score, metrics)
+    │
+    ├─ Signal 2: llm_classify(text)               ← Groq API call
+    │       └─ LLMResult(score, reasoning, model)
+    │
+    ├─ Score combiner
+    │       combined_score = 0.40 × stylometric + 0.60 × llm
+    │
+    ├─ Label generator
+    │       ≥ 0.70 → HIGH_CONFIDENCE_AI
+    │       ≤ 0.30 → HIGH_CONFIDENCE_HUMAN
+    │        else  → UNCERTAIN
+    │
+    ├─ Audit logger (thread-safe in-memory dict, keyed by content_id)
+    │
+    └─ JSON response → client
 ```
 
-`creator_id` is optional. When provided it appears in the audit log and links an appeal back to the submitter.  
-Max text length: 10,000 characters.
+Appeals take a separate path: `POST /appeal` looks up `content_id` in the audit log, appends `creator_reasoning`, and flips `status` to `under_review`. No re-classification occurs.
 
-**Response**
-```json
-{
-  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "attribution": "Human",
-  "confidence_score": 0.0895,
-  "signals": {
-    "stylometric_ai_probability": 0.1487,
-    "llm_ai_probability": 0.05
-  },
-  "transparency_label": {
-    "label_type": "HIGH_CONFIDENCE_HUMAN",
-    "headline": "Likely Human-Written",
-    "confidence_display": "High Confidence (82%)",
-    "body": "Our analysis strongly suggests this content was written by a human...",
-    "action_note": null,
-    "signals_summary": { ... }
-  },
-  "status": "classified"
-}
-```
+### Why two signals?
 
-`confidence_score` is P(AI) from 0.0 to 1.0. Near 0.0 = confident human; near 1.0 = confident AI; near 0.5 = uncertain.
+Single-signal detection has an obvious failure mode: if the signal is wrong, there is no check. The two signals chosen here fail in opposite directions, which is the point.
 
----
+**Signal 1 — Stylometric heuristics** measures the *statistical structure* of writing: how uniform sentence lengths are, how formal the vocabulary register is, how varied the punctuation is. It runs entirely in Python with no external API call. AI writing is structurally uniform — LLMs optimize for readable, coherent output, which means their sentence lengths cluster, their vocabulary sits in a predictable mid-range, and their punctuation is conventional.
 
-### POST /appeal
+**Signal 2 — LLM classification via Groq** measures *semantic and stylistic feel*: whether the text uses hedging phrases, has authentic emotional texture, shows personal specificity, or carries the idiosyncratic choices of a real writer. This runs against `llama-3.3-70b-versatile` at temperature 0.1.
 
-**Request**
-```json
-{
-  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "creator_reasoning": "I wrote this poem in 2019. My writing style is naturally sparse and structured."
-}
-```
+These two signals are genuinely independent — stylometrics reads patterns in character sequences without understanding meaning, and the LLM reads meaning without running any statistics. The same text can produce discordant scores: the spec's sunset text scored 0.73 on stylometrics (two nearly identical sentence lengths → low CV) but 0.2 on the LLM (the model recognized emotional authenticity). Combined: 0.41, landing in UNCERTAIN rather than firing a false confident accusation.
 
-**Response**
-```json
-{
-  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "status": "under_review",
-  "message": "Your appeal has been recorded. The classification is now marked 'under review.' A human reviewer will assess your contest."
-}
-```
+### Why 60/40 weighting?
 
----
+LLM classification carries more weight (60%) because it captures properties that statistics cannot: hedging language, authentic voice, personal detail. Stylometrics is fast, interpretable, and works without an API key — but on short creative texts it is a weaker prior. Its 40% weight is still not decorative: when the LLM is unavailable it provides a meaningful fallback; when the LLM returns ~0.5 it breaks the tie; and when both signals agree strongly it pushes the combined score further from 0.5.
 
-### GET /log
+### Why this threshold design?
 
-Returns all audit entries as a JSON object keyed by `content_id`.
+The thresholds (≥0.70 = AI, ≤0.30 = Human, else UNCERTAIN) are deliberately asymmetric toward caution. A false accusation causes real harm; expressing uncertainty costs nothing. The displayed confidence percentage (`|score - 0.5| × 200`) tells a non-technical reader how far from a coin-flip the system is — a score of 0.71 maps to "High Confidence (42%)", which is honest: it crossed the threshold, but barely.
 
----
+### What I would change for real deployment
 
-### GET /status/{content_id}
-
-Returns a single audit entry including any appeals. Use this to check whether a classification has been appealed.
+1. **Persistent storage.** The audit log is in-memory and resets on restart. The `audit.py` module is isolated — the dict can be swapped for a DB-backed store with no changes to any other file.
+2. **LLM cost controls.** Every `/submit` hits the Groq API. A production version would cache classifications by text hash, or use a cheaper embedding-based first pass that escalates to the LLM only for uncertain cases.
+3. **Signal calibration with labeled data.** The current thresholds and sub-metric weights were calibrated by hand against a small test set. Real calibration requires a labeled corpus and systematic threshold tuning (e.g., ROC analysis).
 
 ---
 
 ## Detection Signals
 
-### Signal 1 — Stylometric Heuristics (structural)
+### Signal 1 — Stylometric Heuristics
 
-Pure Python, no API required.
+**What it measures:** Statistical properties of writing structure, computed in pure Python with no API call.
 
 | Sub-metric | Applies when | What it measures | AI indicator | Weight |
 |---|---|---|---|---|
@@ -149,17 +103,23 @@ Pure Python, no API required.
 | **Type-token ratio** | ≥ 100 words | Unique words ÷ total words | Very low TTR → repetitive → AI | 25% |
 | **Punctuation variety** | always | Distinct punctuation chars used ÷ charset size | Low variety → AI | 15% |
 
-**Why the vocabulary metric switches at 100 words:** On short texts, TTR saturates — almost every word appears exactly once regardless of authorship. Testing confirmed all four M4 test inputs (43–55 words) produced TTR ≥ 0.87 across every content type. TTR provides no signal. Average word length does not saturate: formal AI writing reliably uses longer Latinate vocabulary (avg ~5.5–7.0 chars); casual human writing uses shorter words (avg ~3.5–4.5 chars). The response includes a `vocab_metric_used` field so callers know which branch ran.
+**Why this signal:** It is fully deterministic (no API dependency), interpretable (each sub-score has a named cause), and fails in a different direction than the LLM. When the API is unavailable, stylometrics alone provides a reasonable fallback score.
+
+**Why the vocabulary metric switches at 100 words:** On short texts, TTR saturates — almost every word appears exactly once regardless of authorship. Testing confirmed all four M4 test inputs (43–55 words) produced TTR ≥ 0.87 across every content type. Average word length does not saturate: formal AI writing reliably uses longer Latinate vocabulary (avg ~5.5–7.0 chars) versus casual human writing (~3.5–4.5 chars). The response includes a `vocab_metric_used` field so callers know which branch ran.
+
+**What it misses:** Non-native English speakers with limited vocabulary produce structurally simple writing that fires the AI signal regardless of authorship — this is a fairness problem, not just an accuracy one (see Known Limitations). Repetition-heavy poetry (refrains, villanelles) drives TTR low, making genuinely human writing look AI-generated. Formal academic human prose has naturally low sentence CV and long average word length — both AI indicators — causing false positives for expository human writing.
 
 ---
 
 ### Signal 2 — LLM Classifier (Groq)
 
-Sends text to `llama-3.3-70b-versatile` (temperature 0.1) with a structured prompt requesting `{"ai_probability": float, "reasoning": string}`. Returns P(AI) and one sentence of reasoning.
+**What it measures:** Semantic and stylistic feel — whether the text hedges, sounds emotionally authentic, has personal specificity, or carries idiosyncratic human choices. Sends text to `llama-3.3-70b-versatile` (temperature 0.1) with a structured prompt requesting `{"ai_probability": float, "reasoning": string}`.
 
-The LLM carries 60% weight because it captures what statistics cannot: hedging phrases, authentic personal voice, emotional texture, specific concrete detail vs. AI's smooth generalization.
+**Why this signal:** It captures properties that statistics cannot quantify: hedging phrases ("It is worth noting…"), perfectly balanced paragraph structure, absence of concrete detail, uncanny emotional smoothness. These are reliable AI markers the stylometric signal is blind to.
 
-If the API call fails or returns malformed JSON, the signal falls back to 0.5 (uncertain) — the endpoint keeps working, it just loses the stronger signal.
+**Fallback behavior:** If the API call fails or returns malformed JSON, the signal returns `score=0.5` (uncertain) — the endpoint keeps working, it just loses the stronger signal.
+
+**What it misses:** LLM score on borderline texts is not fully deterministic even at temperature 0.1. The same input has produced scores ranging from 0.2 to 0.7 across different runs on the project's own test texts (see Known Limitations #4). The LLM also cannot inspect metadata or context outside the text itself — it only sees words.
 
 ---
 
@@ -173,19 +133,23 @@ combined_score = 0.40 × stylometric + 0.60 × llm
 
 ## Confidence Scoring
 
-`confidence_score` in the response is the raw combined P(AI) score. The displayed confidence percentage in the label is:
+`confidence_score` in the response is the raw combined P(AI) score (0.0 = certainly human, 1.0 = certainly AI). The displayed confidence percentage in the label is a separate quantity:
 
 ```
 confidence_pct = |combined_score - 0.5| × 200
 ```
 
+This converts the raw score into "how far from a coin-flip is this?" — a number a non-technical reader can interpret.
+
 | Score | Confidence display | Label type |
 |---|---|---|
-| 0.0895 | High Confidence (82%) | HIGH_CONFIDENCE_HUMAN |
-| 0.4126 | Low Confidence (17%) | UNCERTAIN |
-| 0.5 | Low Confidence (0%) | UNCERTAIN |
-| 0.7516 | High Confidence (50%) | HIGH_CONFIDENCE_AI |
+| 0.09 | High Confidence (81%) | HIGH_CONFIDENCE_HUMAN |
+| 0.41 | Low Confidence (17%) | UNCERTAIN |
+| 0.50 | Low Confidence (0%) | UNCERTAIN |
+| 0.75 | High Confidence (50%) | HIGH_CONFIDENCE_AI |
 | 0.95 | High Confidence (90%) | HIGH_CONFIDENCE_AI |
+
+**How the scoring was validated:** After implementing the formula, four test inputs were run — clearly AI, clearly human, and two borderline cases — and the resulting scores were checked for correct direction and sensible magnitude. This is where TTR saturation was discovered (all inputs scored ≥ 0.87 regardless of content), leading to the length-adaptive vocabulary metric. The two example outputs below show the range the system actually produces across genuinely different inputs.
 
 ### Two real examples showing meaningful variation
 
@@ -194,10 +158,10 @@ confidence_pct = |combined_score - 0.5| × 200
 > *"ok so i finally tried that new ramen place downtown and honestly? underwhelming..."*
 
 ```
-stylometric_score : 0.1487  (sentence CV=0.61 — high variation, human-like)
+stylometric_score : 0.1574  (sentence CV=0.61 — high variation, human-like)
 llm_score         : 0.05    ("informal tone, colloquial expressions, specific sensory detail")
-combined_score    : 0.0895
-label             : HIGH_CONFIDENCE_HUMAN — "High Confidence (82%)"
+combined_score    : 0.093
+label             : HIGH_CONFIDENCE_HUMAN — "High Confidence (81%)"
 ```
 
 **Lower-confidence UNCERTAIN** — spec's descriptive sunset text (29 words):
@@ -205,13 +169,13 @@ label             : HIGH_CONFIDENCE_HUMAN — "High Confidence (82%)"
 > *"The sun dipped below the horizon, painting the sky in hues of amber and rose..."*
 
 ```
-stylometric_score : 0.7314  (sentence CV=0.03 — only 2 near-identical sentence lengths → AI signal)
-llm_score         : 0.2     ("descriptive language and emotional authenticity suggest a human touch")
+stylometric_score : 0.7314  (sentence CV=0.03 — two near-identical sentence lengths → AI signal)
+llm_score         : 0.20    ("descriptive language and emotional authenticity suggest a human touch")
 combined_score    : 0.4126
 label             : UNCERTAIN — "Low Confidence (17%)"
 ```
 
-The signals disagree: stylometrics fires the AI alarm (two structurally identical sentences), but the LLM recognizes the sensory specificity and emotional register of the text as human. Combined score 0.41 sits in the UNCERTAIN band and the label says so directly. A 0.09 and a 0.41 both produce `attribution: "Human"` — but the label text is completely different. This is the design intent.
+The signals disagree: stylometrics fires the AI alarm (uniform structure), but the LLM recognizes sensory specificity and emotional register as human. Combined score 0.41 lands in the UNCERTAIN band. A 0.09 and a 0.41 both produce `attribution: "Human"` — but the label text is completely different. This is the design intent.
 
 ---
 
@@ -246,27 +210,14 @@ All three label types with exact body text as returned by the API.
 
 ---
 
-## Appeals Workflow
-
-A creator who disputes a classification sends `POST /appeal` with their `content_id` and `creator_reasoning`. The system:
-
-1. Looks up the `content_id` in the audit log — returns 404 if unknown.
-2. Appends `{ timestamp, creator_reasoning }` to `entry["appeals"]`.
-3. Sets `entry["status"]` from `"classified"` to `"under_review"`.
-4. Returns a confirmation.
-
-No automated re-classification occurs. The appeals endpoint captures the human context (the creator's explanation) that the automated pipeline cannot see. A human reviewer retrieves the full entry via `GET /status/{content_id}` and sees: the original score, both signal scores and reasoning, and the creator's verbatim explanation.
-
----
-
 ## Rate Limiting
 
 | Endpoint | Limit | Reasoning |
 |---|---|---|
-| `POST /submit` | 10/minute, 50/hour per IP | Each call hits the Groq API — real cost and latency. 10/min is generous for legitimate single-user usage while blocking scripts that loop submissions. The 50/hr cap prevents an attacker from burning significant API quota by staying just under the per-minute limit. |
-| `POST /appeal` | 5/minute per IP | No external API call, but spamming appeals would flood the log and make human review unworkable. 5/min is more than enough for a real dispute; low enough to prevent abuse. |
+| `POST /submit` | 10/minute, 50/hour per IP | Each call hits the Groq API — real cost and latency. 10/min is generous for legitimate single-user usage while blocking automated loops. The 50/hr cap prevents an attacker from burning API quota by staying just under the per-minute ceiling. |
+| `POST /appeal` | 5/minute per IP | No external API call, but spamming appeals would flood the log and make human review unworkable. 5/min is more than enough for a genuine dispute. |
 
-### Rate-limit test output — 12 rapid requests against live server
+### Live evidence — 12 rapid requests against running server
 
 ```
 Request  1 : 200
@@ -283,7 +234,7 @@ Request 11 : 429
 Request 12 : 429
 ```
 
-9 of 12 succeeded (the test also submitted once to obtain a `content_id` before the loop, consuming the 10th slot). Requests 10–12 in the loop received `429 Too Many Requests`:
+9 of 12 succeeded (one prior submission to obtain a `content_id` consumed the 10th slot). Requests 10–12 received `429 Too Many Requests`:
 
 ```json
 {
@@ -295,13 +246,151 @@ Request 12 : 429
 
 ---
 
-## Audit Log
+## Known Limitations
 
-Every decision is stored in a thread-safe in-memory dict keyed by `content_id`. Each entry captures: `timestamp`, `content_id`, `creator_id`, `content_preview` (150 chars), `llm_score`, `stylometric_score`, `confidence` (combined), `attribution`, full `signals` block with sub-metric detail, `label`, `status`, and `appeals` array.
+### 1. Non-native English speakers — a fairness problem, not just an accuracy problem
 
-**Production note:** The log resets on restart. Swap the dict in `audit.py` for a database-backed store for persistence. No other files need to change.
+Writers with limited English vocabulary produce structurally simple, uniform prose. Low sentence CV, shorter average word length, and consistent register all fire the AI signal — not because the writing resembles AI output, but because the signals were calibrated against native English writing where casual means varied and formal means Latinate. A false HIGH_CONFIDENCE_AI label here is both an accuracy failure and a fairness failure: the system is systematically harder on writers whose linguistic background differs from the calibration baseline. The appeals workflow is the only mitigation in the current design.
 
-### Live log entries (from GET /log)
+### 2. Formal academic human writing — a structural false positive
+
+Academic and expository human writing has naturally low sentence-length CV (paragraphs are consistently structured) and long average word length (domain vocabulary is Latinate). Both fire the AI signal. Live testing confirmed this: a two-sentence monetary-policy excerpt scored 0.74 (HIGH_CONFIDENCE_AI at 47% confidence). The LLM agreed (0.80 AI) because phrasing like "has been extensively studied in the literature" matches AI academic writing patterns. The 47% confidence display and the appeals note on the label are the mitigations — the system signals its uncertainty honestly and tells the author what to do.
+
+### 3. Very short texts — insufficient signal
+
+For texts under about 25 words or 2 sentences, the stylometric signal returns `score=0.5` (the `insufficient_text` fallback) and the LLM has very little to classify. The result is UNCERTAIN with near-zero confidence — not appropriate caution, but genuinely nothing to measure. A haiku, tweet, or one-sentence excerpt will always land UNCERTAIN regardless of actual authorship.
+
+### 4. LLM score variance across runs of identical text
+
+`temperature=0.1` reduces but does not eliminate run-to-run variation in the LLM signal. The project's own sunset test text produced `llm_score=0.7` (combined 0.72, HIGH_CONFIDENCE_AI) in one run and `llm_score=0.2` (combined 0.41, UNCERTAIN) in another — on identical input. The stylometric signal is fully deterministic; the LLM signal is not. A production deployment would want `temperature=0.0`, response caching keyed on a text hash, or multiple-sample averaging.
+
+---
+
+## Spec Reflection
+
+### One way the spec guided implementation
+
+The spec required three specific label variants with different text based on the confidence score. Writing out the exact text of all three variants in `planning.md` *before* writing any code forced a design decision that would have otherwise been deferred: what are the threshold boundaries? Once the label text was fixed, the thresholds became derivable. "High Confidence" implies the system is willing to make a strong claim; "Origin Uncertain" implies it isn't. That language pushed the thresholds outward (0.30/0.70 rather than 0.40/0.60) because the word "strongly" in the body text would be dishonest at a score of 0.65.
+
+### One way implementation diverged from spec
+
+The spec identified type-token ratio as the vocabulary sub-metric for stylometrics. TTR was implemented as specified. During M4 testing, all four test inputs (43–55 words) produced TTR ≥ 0.87 regardless of authorship — the signal was useless at short text lengths. The spec didn't anticipate this because it described signals conceptually rather than testing them empirically. The fix — switching to average word length for texts under 100 words — was not in the spec and required a judgment call that only emerged from testing. This is an example of why implementation always diverges from spec: the spec describes what the system should do; only testing reveals what properties of inputs break those assumptions.
+
+---
+
+## AI Usage
+
+### Instance 1 — Generating the LLM classifier prompt
+
+**What I directed:** Asked Claude to generate `llm_classifier.py` — a function that would reliably return `{"ai_probability": float, "reasoning": string}` from the Groq model, with fallback behavior if the API call failed.
+
+**What it produced:** A function matching the signature, a prompt template covering key discriminating factors (sentence structure uniformity, hedging phrases, emotional authenticity, personal specificity). The structure was correct.
+
+**What I revised:** The initial draft did not set `temperature=0.1`. At default temperature the model's classifications varied noticeably between calls on the same text — making the confidence scores unreproducible. I added `temperature=0.1` explicitly. I also added handling for markdown code fences: the model occasionally wraps its JSON output in ` ```json ``` ` blocks despite instructions not to, causing `json.loads()` to fail. The fence-stripping regex was added after observing this failure mode in testing.
+
+### Instance 2 — Generating the stylometric analyzer
+
+**What I directed:** Provided the planning.md Section 1 normalization formulas and sub-metric weights and asked Claude to generate `stylometric.py` with `analyze(text) -> StylometricResult`.
+
+**What it produced:** A function that matched the signatures and implemented all three sub-metrics with the correct weights. TTR was used universally, as specified.
+
+**What I revised:** After running the M4 four-input test with TTR in place, all test inputs returned TTR ≥ 0.87 (saturated), making the vocabulary sub-metric useless. I identified the root cause (short texts exhaust their vocabulary naturally), researched an alternative (average word length is length-stable), and revised the function to branch on word count: `≥ 100` words uses TTR, `< 100` uses average word length. I also calibrated the normalization range for average word length (`(avg_word_len - 3.5) / 3.5`) against the actual test inputs — casual prose averaged ~4.2 chars, formal AI prose averaged ~6.2 chars — and verified the formula produced the right direction before committing the change.
+
+---
+
+## File Structure
+
+```
+provenance-guard/
+├── app.py                    # Flask app — all 4 routes + rate limiting
+├── audit.py                  # Thread-safe in-memory audit log
+├── labels.py                 # Transparency label generation (3 variants)
+├── detection/
+│   ├── __init__.py
+│   ├── stylometric.py        # Signal 1: structural heuristics (length-adaptive)
+│   └── llm_classifier.py     # Signal 2: Groq LLM classification
+├── planning.md               # Architecture spec, signal design, edge cases
+├── requirements.txt
+└── .env.example
+```
+
+---
+
+## API Reference
+
+### POST /submit
+
+**Request**
+```json
+{
+  "text": "The fog came on little cat feet...",
+  "creator_id": "user-123"
+}
+```
+
+`creator_id` is optional. When provided it appears in the audit log and links an appeal back to the submitter.
+Max text length: 10,000 characters.
+
+**Response**
+```json
+{
+  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "attribution": "Human",
+  "confidence_score": 0.0895,
+  "signals": {
+    "stylometric_ai_probability": 0.1487,
+    "llm_ai_probability": 0.05
+  },
+  "transparency_label": {
+    "label_type": "HIGH_CONFIDENCE_HUMAN",
+    "headline": "Likely Human-Written",
+    "confidence_display": "High Confidence (81%)",
+    "body": "Our analysis strongly suggests this content was written by a human...",
+    "action_note": null,
+    "signals_summary": { "..." }
+  },
+  "status": "classified"
+}
+```
+
+`confidence_score` is P(AI) from 0.0 to 1.0. Near 0.0 = confident human; near 1.0 = confident AI; near 0.5 = uncertain.
+
+---
+
+### POST /appeal
+
+**Request**
+```json
+{
+  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "creator_reasoning": "I wrote this poem in 2019. My writing style is naturally sparse and structured."
+}
+```
+
+**Response**
+```json
+{
+  "content_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "under_review",
+  "message": "Your appeal has been recorded. The classification is now marked 'under review.' A human reviewer will assess your contest."
+}
+```
+
+No automated re-classification occurs. A human reviewer retrieves the full entry via `GET /status/{content_id}` to see the original scores, both signal reasoning notes, and the creator's verbatim explanation.
+
+---
+
+### GET /log
+
+Returns all audit entries as a JSON object keyed by `content_id`. Each entry includes `timestamp`, `creator_id`, `content_preview`, `llm_score`, `stylometric_score`, `confidence`, `attribution`, full `signals` block, `label`, `status`, and `appeals` array.
+
+### GET /status/{content_id}
+
+Returns a single audit entry. Use this to check classification details or whether a submission has been appealed.
+
+---
+
+### Live audit log entries (from GET /log)
 
 ```json
 {
@@ -394,89 +483,13 @@ Every decision is stored in a thread-safe in-memory dict keyed by `content_id`. 
       },
       "llm": {
         "ai_probability": 0.05,
-        "reasoning": "Informal tone, colloquial expressions, and specific sensory details (the physical reaction to sodium) are strong indicators of human authorship.",
+        "reasoning": "Informal tone, colloquial expressions, and specific sensory details are strong indicators of human authorship.",
         "model": "llama-3.3-70b-versatile"
       }
     },
-    "label": { "label_type": "HIGH_CONFIDENCE_HUMAN", "headline": "Likely Human-Written", "confidence_display": "High Confidence (82%)" },
+    "label": { "label_type": "HIGH_CONFIDENCE_HUMAN", "headline": "Likely Human-Written", "confidence_display": "High Confidence (81%)" },
     "status": "classified",
     "appeals": []
   }
 }
-```
-
----
-
-## Known Limitations
-
-### 1. Non-native English speakers — a fairness problem, not just an accuracy problem
-
-A writer with limited English vocabulary tends to produce shorter sentences, simpler word choices, and more uniform sentence structure. All three fire the AI signal: low sentence CV, low average word length (casual), and a stylometric score that tilts human for the wrong reason (average word length is short like casual prose, not because the writing is colloquial but because the writer's vocabulary is constrained). Meanwhile, the LLM may read the simplified, consistent register as AI-like and score it high.
-
-This is not a generic calibration problem. It is structural: the stylometric signal was calibrated against native English writing where casual = short/varied and formal = long/uniform. Non-native writing breaks that assumption — it can be formal in intent but simple in execution, which neither signal is designed to handle correctly. A false HIGH_CONFIDENCE_AI label on a non-native English writer's genuine work is both an accuracy failure and a fairness failure: the system is systematically harder on writers whose linguistic background differs from the calibration baseline.
-
-The appeals workflow is the only mitigation in the current design.
-
-### 2. Very short texts — insufficient signal, not just low confidence
-
-For texts under about 25 words or 2 sentences, the stylometric signal returns `score=0.5` (the `insufficient_text` fallback). The LLM also has very little to classify and tends toward moderate scores. The result is UNCERTAIN with near-zero confidence — not because the system is being appropriately cautious, but because there is genuinely nothing to measure. A haiku, a tweet, or a one-sentence excerpt will always land UNCERTAIN regardless of actual authorship. This is correct behavior (expressing uncertainty when uncertain) but may mislead users who expect the system to work on any input.
-
-### 3. Formal academic human writing — a structural false positive
-
-Academic and expository human writing has naturally low sentence-length CV (paragraphs are consistently structured) and long average word length (domain vocabulary is Latinate). Both of these fire the AI signal. Live testing confirmed this: a two-sentence monetary-policy excerpt scored 0.74 (HIGH_CONFIDENCE_AI at 47% confidence). The LLM agreed (0.80 AI), probably because "has been extensively studied in the literature" and "face a fundamental tension between" are common AI academic writing patterns. The 47% confidence display and the appeals note on the label are the mitigations — the system doesn't suppress the classification, it signals its uncertainty honestly and tells the author what to do.
-
-### 4. LLM score variance across runs of identical text
-
-`temperature=0.1` reduces but does not eliminate run-to-run variation in the LLM signal. Re-running the project's own descriptive sunset example during the final walkthrough produced `llm_score=0.7` (combined 0.72, HIGH_CONFIDENCE_AI) versus an earlier run's `llm_score=0.2` (combined 0.41, UNCERTAIN) on the identical input text — see the Confidence Scoring examples above for the original capture. The stylometric signal is fully deterministic since it's a pure function of the text; the LLM signal is not. This means the same submission can, in rare cases, receive a different label on a second submission. A production deployment would want either `temperature=0.0`, response caching keyed on a text hash, or multiple-sample averaging to make classifications reproducible.
-
----
-
-## Spec Reflection
-
-### One way the spec guided implementation
-
-The spec required three specific label variants with different text based on the confidence score — not just a binary label. Writing out the exact text of all three variants in `planning.md` *before* writing any code forced a design decision that would have otherwise been deferred: what are the threshold boundaries? Once the label text was fixed, the thresholds became derivable. "High Confidence" implies the system is willing to make a claim; "Low Confidence" / "Origin Uncertain" implies it isn't. That language pushed the thresholds outward (0.30/0.70 rather than 0.40/0.60) because the word "strongly" in the body text would be dishonest at a score of 0.65.
-
-### One way implementation diverged from spec
-
-The spec specified stylometric heuristics as the second signal and mentioned type-token ratio as a candidate metric. TTR was implemented as specified. During M4 testing we discovered that TTR saturates on short texts: all four test inputs (43–55 words) produced TTR ≥ 0.87 regardless of authorship, making it useless as a discriminator. The spec didn't anticipate this because it described signals conceptually rather than testing them empirically.
-
-The fix — switching to average word length for texts under 100 words — was not in the spec. It was discovered through testing and required a judgment call about which property would remain discriminating at short text lengths. This is an example of why implementation always diverges from spec: the spec describes what the system should do; only testing reveals what properties of inputs break those assumptions.
-
----
-
-## AI Usage
-
-### Instance 1 — Generating the LLM classifier prompt
-
-**What I directed:** I asked Claude to generate `llm_classifier.py` — specifically a prompt that would reliably return a JSON object `{"ai_probability": float, "reasoning": string}` from the Groq model, with fallback behavior if the API call failed.
-
-**What it produced:** A function matching the signature, a prompt template that covered key discriminating factors (sentence structure uniformity, hedging phrases, emotional authenticity, personal specificity). The prompt structure was correct.
-
-**What I revised:** The initial draft did not set `temperature=0.1`. At default temperature the model's classifications varied noticeably between calls on the same text — which makes the confidence scores meaningless because they aren't reproducible. I added `temperature=0.1` explicitly. I also added handling for markdown code fences: the model occasionally wraps its JSON output in ` ```json ``` ` blocks despite instructions not to, and without stripping those, `json.loads()` fails. The fallback to `score=0.5` on parse error was in the original draft but I added the fence-stripping logic.
-
-### Instance 2 — Generating the stylometric analyzer
-
-**What I directed:** I provided the planning.md Section 1 normalization formulas and sub-metric weights and asked Claude to generate `stylometric.py` with `analyze(text) -> StylometricResult`.
-
-**What it produced:** A function that matched the signatures and implemented all three sub-metrics with the correct weights. TTR was used universally, as specified.
-
-**What I revised:** After running the M4 four-input test with TTR in place, all test inputs returned TTR ≥ 0.87 (saturated), making the vocabulary sub-metric useless. I identified the root cause (short texts always exhaust their vocabulary naturally), researched an alternative (average word length is length-stable), and revised the function to branch on word count: `>= 100` words uses TTR, `< 100` uses average word length. I also calibrated the normalization range for average word length (`(avg_word_len - 3.5) / 3.5`) against the actual test inputs — casual prose averaged ~4.2 chars, formal AI prose averaged ~6.2 chars — and verified the formula produced the right direction before committing the change.
-
----
-
-## File Structure
-
-```
-provenance-guard/
-├── app.py                    # Flask app — all 4 routes + rate limiting
-├── audit.py                  # Thread-safe in-memory audit log
-├── labels.py                 # Transparency label generation (3 variants)
-├── detection/
-│   ├── __init__.py
-│   ├── stylometric.py        # Signal 1: structural heuristics (length-adaptive)
-│   └── llm_classifier.py     # Signal 2: Groq LLM classification
-├── planning.md               # Architecture spec, signal design, edge cases
-├── requirements.txt
-└── .env.example
 ```
